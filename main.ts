@@ -243,10 +243,12 @@ interface Hunk {
   n: string[];
   ctx: (number | null)[];
   noEol: boolean;
+  plusNoEol: boolean;
 }
 interface UniSection {
   oldPath: string | null;
   newPath: string | null;
+  sawPair: boolean;
   create: boolean;
   del: boolean;
   hunks: Hunk[];
@@ -270,7 +272,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     if (line.startsWith('diff --git ')) {
       const m = /^diff --git a\/(\S+) b\/(\S+)$/.exec(line);
       if (m === null) throw new Exit2(`error: parse ${i + 1}`);
-      cur = { oldPath: m[1]!, newPath: m[2]!, create: false, del: false, hunks: [] };
+      cur = { oldPath: m[1]!, newPath: m[2]!, sawPair: false, create: false, del: false, hunks: [] };
       sections.push(cur);
       inHeader = true;
       i++;
@@ -278,12 +280,13 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     }
     if (line.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) {
       if (cur === null || !inHeader) {
-        cur = { oldPath: null, newPath: null, create: false, del: false, hunks: [] };
+        cur = { oldPath: null, newPath: null, sawPair: false, create: false, del: false, hunks: [] };
         sections.push(cur);
         inHeader = true;
       }
       cur.oldPath = uniPath(line.slice(4));
       cur.newPath = uniPath(lines[i + 1]!.slice(4));
+      cur.sawPair = true;
       i += 2;
       continue;
     }
@@ -293,7 +296,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       if (m === null) throw new Exit2(`error: parse ${i + 1}`);
       inHeader = false;
       const a = Number(m[1]);
-      const body: { kind: string; text: string; backslash: boolean }[] = [];
+      const body: { kind: string; text: string; backslash: boolean; emptyLine: boolean }[] = [];
       i++;
       while (i < lines.length) {
         const bl = lines[i]!;
@@ -301,24 +304,29 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
         if (bl.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
         if (bl === '' || bl.startsWith(' ') || bl.startsWith('-') || bl.startsWith('+') || bl.startsWith('\\')) {
           const kind = bl === '' ? ' ' : bl[0]!;
-          body.push({ kind, text: kind === '\\' ? '' : bl.slice(1), backslash: false });
+          body.push({ kind, text: kind === '\\' ? '' : bl.slice(1), backslash: false, emptyLine: bl === '' });
           i++;
           continue;
         }
         break;
       }
-      // A `\` line refers to the body line before it; trailing empty lines are not part of the body.
+      // A `\` line refers to the body line before it. Only lines that were
+      // empty in the patch are dropped from the end of a body (SPEC 6); a
+      // context line written as a single space is a real body line whose
+      // text is empty, and stays.
       for (let k = 0; k < body.length; k++) {
         if (body[k]!.kind === '\\' && k > 0) body[k - 1]!.backslash = true;
       }
       let end = body.length;
-      while (end > 0 && body[end - 1]!.kind === ' ' && body[end - 1]!.text === '') end--;
+      while (end > 0 && body[end - 1]!.kind === ' ' && body[end - 1]!.emptyLine) end--;
       const kept = body.slice(0, end);
       const o: string[] = [];
       const n: string[] = [];
       const ctx: (number | null)[] = [];
       let noEol = false;
+      let plusNoEol = false;
       let lastCtxPlus = -1;
+      let lastPlus = -1;
       for (let k = 0; k < kept.length; k++) {
         const b = kept[k]!;
         if (b.kind === ' ') {
@@ -332,21 +340,25 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
           n.push(b.text);
           ctx.push(null);
           lastCtxPlus = k;
+          lastPlus = k;
         }
       }
       if (lastCtxPlus >= 0 && lastCtxPlus + 1 < kept.length && kept[lastCtxPlus + 1]!.kind === '\\') noEol = true;
-      cur.hunks.push({ a, o, n, ctx, noEol });
+      if (lastPlus >= 0 && lastPlus + 1 < kept.length && kept[lastPlus + 1]!.kind === '\\') plusNoEol = true;
+      cur.hunks.push({ a, o, n, ctx, noEol, plusNoEol });
       continue;
     }
     if (cur !== null && inHeader) {
       if (line.startsWith('--- ')) throw new Exit2(`error: parse ${i + 2}`);
       if (line.startsWith('rename from ')) {
-        if (cur.oldPath === null && cur.newPath === null) cur.oldPath = line.slice('rename from '.length).trim();
+        // Rename lines name the paths when no ---/+++ pair does, and so
+        // override the diff --git paths (SPEC 6's order of naming).
+        if (!cur.sawPair) cur.oldPath = line.slice('rename from '.length).trim();
         i++;
         continue;
       }
       if (line.startsWith('rename to ')) {
-        if (cur.oldPath === null && cur.newPath === null) cur.newPath = line.slice('rename to '.length).trim();
+        if (!cur.sawPair) cur.newPath = line.slice('rename to '.length).trim();
         i++;
         continue;
       }
@@ -378,15 +390,19 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
         if (np === null || !safe(np)) throw new Fail('unsafe', np ?? '');
         if (tree.get(np) !== null) throw new Fail('exists', np);
         const plus: string[] = [];
-        let noEol = false;
+        // The final break is decided by the `\` after the file's last `+`
+        // line, which sits in the last hunk that contributes one (SPEC 6).
+        let lastPlusNoEol = false;
         for (const h of s.hunks) {
-          for (let j = 0; j < h.n.length; j++) if (h.ctx[j] === null) plus.push(h.n[j]!);
-          if (h.noEol) noEol = true;
+          let contributed = false;
+          for (let j = 0; j < h.n.length; j++)
+            if (h.ctx[j] === null) {
+              plus.push(h.n[j]!);
+              contributed = true;
+            }
+          if (contributed) lastPlusNoEol = h.plusNoEol;
         }
-        // The `\` after the last `+` line decides the final break.
-        const lastH = s.hunks[s.hunks.length - 1];
-        const lastPlus = lastH !== undefined && lastH.n.some((_, j) => lastH.ctx[j] === null);
-        tree.now.set(np, plus.length === 0 ? '' : plus.join('\n') + (noEol && lastPlus ? '' : '\n'));
+        tree.now.set(np, plus.length === 0 ? '' : plus.join('\n') + (lastPlusNoEol ? '' : '\n'));
       });
       continue;
     }
@@ -550,16 +566,25 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
     if (line.startsWith('*** Add File: ')) {
       const p = line.slice('*** Add File: '.length).trim();
       const body: string[] = [];
+      const fromBlank: boolean[] = [];
       i++;
       while (i < last && !isSectionStart(lines[i]!)) {
         const bl = lines[i]!;
-        if (bl.startsWith('+')) body.push(bl.slice(1));
-        else if (bl === '') body.push('');
-        else throw new Exit2(`error: parse ${i + 1}`);
+        if (bl.startsWith('+')) {
+          body.push(bl.slice(1));
+          fromBlank.push(false);
+        } else if (bl === '') {
+          body.push('');
+          fromBlank.push(true);
+        } else throw new Exit2(`error: parse ${i + 1}`);
         i++;
       }
-      // Blank lines at the end of a section are not part of it.
-      while (body.length > 0 && body[body.length - 1] === '') body.pop();
+      // Blank lines at the end of a section are not part of it (SPEC 8); a
+      // `+` line whose text is empty is a line of the file and stays.
+      while (body.length > 0 && fromBlank[body.length - 1]) {
+        body.pop();
+        fromBlank.pop();
+      }
       edits.push((tree) => {
         if (!safe(p)) throw new Fail('unsafe', p);
         if (tree.get(p) !== null) throw new Fail('exists', p);
